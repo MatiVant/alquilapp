@@ -1,0 +1,33 @@
+import { getDb } from "@/lib/db"
+import { agencies, appUsers, contracts, contractIncidents, monthClosings, monthlyPayments, movements, owners, properties, propertyCharges, tenants } from "@/lib/db/schema"
+
+type ImportPayload = { settings?: Record<string, unknown>; properties?: Array<Record<string, unknown>>; ownerInfo?: Record<string, Record<string, unknown>>; tenantInfo?: Record<string, Record<string, unknown>>; contracts?: Record<string, Record<string, unknown>>; movements?: Array<Record<string, unknown>>; monthCloses?: Record<string, Record<string, unknown>> }
+const text = (value: unknown) => value == null ? null : String(value)
+const amount = (value: unknown) => String(Number(value) || 0)
+const dateValue = (value: unknown) => { const valueText = text(value); return valueText ? valueText : null }
+
+export async function POST(request: Request) {
+  const expected = process.env.MIGRATION_TOKEN
+  if (!expected) return Response.json({ error: "MIGRATION_TOKEN no configurado" }, { status: 503 })
+  if (request.headers.get("x-migration-token") !== expected) return Response.json({ error: "Token de migración inválido" }, { status: 401 })
+  const payload = await request.json() as ImportPayload
+  const db = getDb()
+  const imported = { owners: 0, tenants: 0, properties: 0, contracts: 0, payments: 0, movements: 0, closings: 0, documentsPending: 0 }
+  const settings = payload.settings || {}
+  const [agency] = await db.insert(agencies).values({ name: text(settings.name) || "AlquilApp", legalName: text(settings.legalName), taxId: text(settings.cuit), address: text(settings.address), phone: text(settings.phone), email: text(settings.email), defaultCommission: amount(settings.defaultCommission || 10), contractFeePercent: amount(settings.contractFeePercent || 5) }).returning()
+  const ownerIds = new Map<string, string>()
+  const ownerNames = Array.from(new Set((payload.properties || []).map(p => text(p.owner) || "Sin propietario")))
+  for (const name of ownerNames) { const info = payload.ownerInfo?.[name] || {}; const [row] = await db.insert(owners).values({ agencyId: agency.id, name, phone: text(info.phone), email: text(info.email), address: text(info.address), document: text(info.document), bankAccount: text(info.bank), notes: text(info.notes) }).returning(); ownerIds.set(name, row.id); imported.owners++ }
+  const tenantIds = new Map<string, string>()
+  const tenantNames = Array.from(new Set((payload.properties || []).map(p => text(p.tenant)).filter(Boolean))) as string[]
+  for (const name of tenantNames) { const info = payload.tenantInfo?.[name] || {}; const [row] = await db.insert(tenants).values({ agencyId: agency.id, name, phone: text(info.phone), email: text(info.email), document: text(info.document), notes: text(info.notes) }).returning(); tenantIds.set(name, row.id); imported.tenants++ }
+  const propertyIds = new Map<number, string>()
+  for (const item of payload.properties || []) { const oldId = Number(item.id); const ownerName = text(item.owner) || "Sin propietario"; const tenantName = text(item.tenant); const [row] = await db.insert(properties).values({ agencyId: agency.id, ownerId: ownerIds.get(ownerName), tenantId: tenantName ? tenantIds.get(tenantName) : undefined, address: text(item.address) || "Sin dirección", unit: text(item.unit), rent: amount(item.rent), commission: amount(item.commission || 10), propertyStatus: text(item.status) || "Disponible", collectionStatus: text(item.collection) || "No alquilada" }).returning(); propertyIds.set(oldId, row.id); const charges = (item.charges || {}) as Record<string, unknown>; await db.insert(propertyCharges).values({ propertyId: row.id, epe: amount(charges.epe), gas: amount(charges.gas), aguas: amount(charges.aguas), tgi: amount(charges.tgi), api: amount(charges.api), expensas: amount(charges.expensas), extraordinary: amount(charges.extraordinarias) }); imported.properties++
+    const records = Array.isArray(item.payments) ? item.payments as Array<Record<string, unknown>> : []; for (const payment of records) { await db.insert(monthlyPayments).values({ propertyId: row.id, month: text(payment.month) || "", status: text(payment.status) || "Pendiente", paidDate: dateValue(payment.paidDate), rent: amount(payment.rent), taxes: amount(payment.taxes), commission: amount(payment.commission), collected: amount(payment.collected), pending: amount(payment.pending), ownerPaid: Boolean(payment.ownerPaid), ownerPaidDate: dateValue(payment.ownerPaidDate) }); imported.payments++ }
+    const contract = payload.contracts?.[String(oldId)]; if (contract) { const [saved] = await db.insert(contracts).values({ propertyId: row.id, startDate: dateValue(contract.startDate), endDate: dateValue(contract.endDate), initialRent: amount(contract.initialRent || item.rent), totalContract: amount(contract.totalContract), deposit: amount(contract.deposit), adjustment: text(contract.adjustment), adjustmentPeriod: text(contract.adjustmentPeriod), tenantDocument: text(contract.tenantDocument), guarantors: text(contract.guarantors), guarantees: text(contract.guarantees), noticeMonths: Number(contract.noticeMonths) || 3, terminationDate: dateValue(contract.terminationDate), terminationNoticeMonths: contract.terminationNoticeMonths == null ? null : Number(contract.terminationNoticeMonths), status: text(contract.status) || "Borrador" }).returning(); imported.contracts++; for (const incident of (contract.incidents || []) as Array<Record<string, unknown>>) await db.insert(contractIncidents).values({ contractId: saved.id, date: text(incident.date) || new Date().toISOString().slice(0, 10), kind: text(incident.kind) || "Incidencia", title: text(incident.title) || "Sin título", notes: text(incident.notes) }) }
+  }
+  for (const item of payload.movements || []) { const propertyId = item.propertyId == null ? undefined : propertyIds.get(Number(item.propertyId)); await db.insert(movements).values({ agencyId: agency.id, propertyId, kind: text(item.kind) || "Otro", concept: text(item.concept), amount: amount(item.amount), applied: amount(item.applied), date: text(item.date) || new Date().toISOString().slice(0, 10), notes: text(item.notes), metadata: item }); imported.movements++ }
+  for (const [month, close] of Object.entries(payload.monthCloses || {})) { await db.insert(monthClosings).values({ agencyId: agency.id, month, status: text(close.status) || "Abierto", closedAt: dateValue(close.closedAt) ? new Date(String(close.closedAt)) : undefined }); imported.closings++ }
+  imported.documentsPending = Object.values(payload.contracts || {}).reduce((sum, c) => sum + (Array.isArray(c.attachments) ? c.attachments.length : 0), 0)
+  return Response.json({ ok: true, agencyId: agency.id, imported })
+}

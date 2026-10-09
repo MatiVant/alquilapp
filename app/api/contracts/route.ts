@@ -1,0 +1,13 @@
+import { and, eq } from "drizzle-orm"
+import { getDb } from "@/lib/db"
+import { agencies, contractIncidents, contracts, properties } from "@/lib/db/schema"
+
+const text = (v: unknown) => v == null || v === "" ? null : String(v)
+const amount = (v: unknown) => String(Number(v) || 0)
+const contractValues = (body: any, propertyId: string) => ({ propertyId, startDate: text(body.startDate), endDate: text(body.endDate), initialRent: amount(body.initialRent), totalContract: amount(body.totalContract), deposit: amount(body.deposit), adjustment: text(body.adjustment), adjustmentPeriod: text(body.adjustmentPeriod), tenantDocument: text(body.tenantDocument), guarantors: text(body.guarantors), guarantees: text(body.guarantees || body.guarantee), noticeMonths: Number(body.noticeMonths) || 3, terminationDate: text(body.terminationDate), terminationNoticeMonths: body.terminationNoticeMonths == null ? null : Number(body.terminationNoticeMonths), status: body.status || "Borrador" })
+async function agencyId() { const [row] = await getDb().select({ id: agencies.id }).from(agencies).limit(1); return row?.id }
+async function saveIncidents(contractId: string, incidents: any[] = []) { const db = getDb(); await db.delete(contractIncidents).where(eq(contractIncidents.contractId, contractId)); for (const incident of incidents) await db.insert(contractIncidents).values({ contractId, date: text(incident.date) || new Date().toISOString().slice(0, 10), kind: incident.kind || "Incidencia", title: incident.title || "Sin título", notes: text(incident.notes) }) }
+
+export async function POST(request: Request) { const body = await request.json(); const propertyId = body.propertyDbId; if (!propertyId) return Response.json({ error: "Falta la propiedad" }, { status: 400 }); const [property] = await getDb().select({ id: properties.id }).from(properties).where(eq(properties.id, propertyId)); if (!property) return Response.json({ error: "Propiedad no encontrada" }, { status: 404 }); const [contract] = await getDb().insert(contracts).values(contractValues(body, property.id)).returning(); await saveIncidents(contract.id, body.incidents); return Response.json(contract, { status: 201 }) }
+
+export async function PATCH(request: Request) { const body = await request.json(); if (!body.dbId) return Response.json({ error: "Falta el identificador del contrato" }, { status: 400 }); const [contract] = await getDb().update(contracts).set(contractValues(body, body.propertyDbId || body.propertyId)).where(eq(contracts.id, body.dbId)).returning(); if (!contract) return Response.json({ error: "Contrato no encontrado" }, { status: 404 }); await saveIncidents(contract.id, body.incidents); return Response.json(contract) }
